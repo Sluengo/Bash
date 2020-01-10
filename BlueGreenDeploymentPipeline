@@ -1,0 +1,643 @@
+GITHUB_PROJECT = "git@bitbucket.org:pbb_api/consumer.git"
+GITHUB_CREDENTIALS_ID = "1e66da07-96aa-481f-9425-f74e782bfce0" //maps to a Jenkins Credentials Vault ID
+APPLICATION_NAME = "Consumer"
+GITHUB_BRANCH = '${env.BRANCH_NAME}'
+HAS_STARTED_CLONE = false
+IS_POST_CLONE = false
+IS_POST_SWAP = false
+COMBINED_OR_SINGLE = "Undefined"
+pipeline {
+    agent any
+    stages {
+
+        stage ('Add Deployment Note') {
+           steps {
+               build job: 'AddDeploymentNote'
+            }
+        }
+        
+        stage ("Checking Environment") {
+          steps {
+            sh '''#!/bin/bash
+              set -e
+              set -x
+              
+              envCount=`aws elasticbeanstalk describe-environments --environment-names | jq '.Environments[] | select(.Status=="Ready")' |  jq '.EnvironmentName' | grep consumer-prod | wc -l`
+              
+              echo "This is the current number of environments: $envCount"
+              
+              if [ $envCount -gt 1 ]
+                then
+                    echo "There is more than one Consumer-Prod environment...please contact DevOps. Aborting..."
+                    #exit 1
+              fi
+              
+              ### Check that there are no pending PRs into master -- if there is, someone deployed but hasn't yet verified
+              PRS="\$(php ~/jenkinsgit/jenkinsgit.php -rCONSUMER --count-pull-requests --dest="master" 2>&1)"
+              if echo \$PRS | grep -q "^0\$"; then
+                  echo "No pending pull requests, continuing:: "
+              else
+                  echo "ERROR: There are existing Pull Request(s) into master. Ensure the QA Verify step was performed. Halting."
+                  echo "failures = ERROR: There are existing Pull Request(s) into master. Ensure the QA Verify step was performed. Halting." > failures.properties
+                  echo \$PRS
+                  exit 1
+              fi
+            '''
+          }
+        }
+        
+        stage ("Deployment Style") {
+            steps {
+                script {
+                    COMBINED_OR_SINGLE = input(id: 'combinedOrSingle', message: 'Is this deployment combined with an API deployment or is it only this single Consumer?',
+                    	parameters: [[$class: 'ChoiceParameterDefinition', defaultValue: 'strDef', 
+                    		description:'Combined or Single Choice', name:'combinedOrSingleChoice', choices: "Single\nCombined"]
+                    	])	
+                }
+            }            
+        }
+
+        stage ("Listing Branches") {
+			steps {
+				echo "Initializing workflow"
+				//checkout code
+				echo GITHUB_PROJECT
+				git url: GITHUB_PROJECT, credentialsId: GITHUB_CREDENTIALS_ID
+				sh 'git branch -r | awk \'{print $1}\' ORS=\'\\n\' >branches.txt'
+			sh '''cut -d '/' -f 2 branches.txt > branch.txt'''
+			}
+        }
+
+        stage('Get Build Branch') {
+			steps {
+				script {
+					liste = readFile 'branch.txt'
+					echo "please click on the link here to chose the branch to build"
+					env.BRANCH_SCOPE = input message: 'Please choose the branch to build ', ok: 'Proceed!',
+					parameters: [choice(name: 'BRANCH_NAME', choices: "${liste}", description: 'Branch to build?')]
+				}
+			}
+        }
+
+        stage('Checkout') {
+			steps {
+				echo "${env.BRANCH_SCOPE}"
+				git branch: "${env.BRANCH_SCOPE}",
+				credentialsId: '1e66da07-96aa-481f-9425-f74e782bfce0',
+				url: 'git@bitbucket.org:pbb_api/consumer.git'
+			}
+        }
+
+        stage('NPM') {
+			steps {
+				sh '''# Update required libs
+				# npm cache clear
+				npm install
+
+				# Do frontend build
+				# gulp --production
+				npm run production
+				'''
+			}
+        }
+
+        stage('Git') {
+			steps {
+				sh """#!/bin/sh
+				set -x
+
+				#############
+				## Production
+				#############
+				
+				### Check that the branch going out is ahead of master
+				COMMITS="\$(git rev-list --left-only --count origin/master...${env.BRANCH_SCOPE} 2>&1)"
+				if echo \$COMMITS | grep -q "^0\$"; then
+                    echo "Branch cleared for delivery. SEND IT!:: "    
+                else
+                    echo "ERROR: Branch behind master. Branch must be QA Verified via stage deployment FIRST! Deployment Aborted.:: "
+                    echo "failures = ERROR: Branch behind master. Branch must be QA Verified via stage deployment FIRST! Deployment Aborted." > failures.properties
+                    exit 1
+                fi
+
+				git rm --cached .elasticbeanstalk/config.yml
+
+
+				git add .env.production
+
+				# Create ebextensions directory
+				mkdir -p .ebextensions
+				# Copy common configuration files in
+				cp -R .elasticbeanstalk/extensions/common/* ./.ebextensions/
+				# Copy Production only configuration files in
+				if [ -d ".elasticbeanstalk/extensions/production" ]; then
+					cp -R .elasticbeanstalk/extensions/production/* ./.ebextensions/
+				fi
+
+				git add public/. --force
+				git add .ebextensions/*
+				HACKYFIXFORSTDERR="\$(git commit -m "Pre-deploy PROD commit" 2>&1)"
+				"""
+			}
+        }
+        
+        stage ('Trigger Add SDT to LogicMonitor') {
+			steps {
+				build job: 'AddSDTLogicMonitor'
+			}
+		}
+            
+        stage('Clone & Deploy') {
+			steps {
+				timeout(time: 5, unit: 'HOURS') {
+					input 'Clone & Deploy ?'
+				} 
+				script {
+					HAS_STARTED_CLONE = true
+				}
+				sh '''#!/bin/bash
+				set -e
+				set -x
+
+				#Get Date for Deployment, add
+				LABEL_ID='-'$(date '+%Y-%m-%d')'-'$(uuidgen | cut -c1-4)
+
+				# Current CNAME
+				CNAME="psconsumerprod.us-west-2.elasticbeanstalk.com"
+
+				#  Prefix for environment name
+				ENV_PREFIX="consumer-prod"
+
+				# Label for Application Version you will delpoy uses environment prefix, date & unique 8 char id
+				VERSION_LABEL="$ENV_PREFIX$LABEL_ID"
+
+				# RDS Security Group ID
+				RDS_SECURITY_GROUP_ID="sg-9d6b11e7"
+
+				# Define Blue & Green Target Groups
+				BLUE_TARGET_GROUP_ARN="arn:aws:elasticloadbalancing:us-west-2:172136542978:targetgroup/puppyspot-targets-core-prod/cc8f9632739f7370"
+				GREEN_TARGET_GROUP_ARN="arn:aws:elasticloadbalancing:us-west-2:172136542978:targetgroup/green-core-prod/2e990424f2694706"
+
+				#Set AWS Region For AWSCLI API calls
+				aws configure set default.region us-west-2
+
+				# Get Current Elastic Beanstalk Environment Name by CNAME
+				ENVIRONMENT_NAME=$(aws elasticbeanstalk describe-environments | jq '.Environments' | jq -r '.[] | select(.CNAME=="'$CNAME'") | .EnvironmentName')
+				echo '[*] AWS Elastic Beanstalk Current Environment Name: ' $ENVIRONMENT_NAME
+
+				eb use $ENVIRONMENT_NAME
+                
+				# UUID for new environment
+				UUID=$(uuidgen | cut -c1-8)
+				NEW_ENVIRONMENT_NAME="$ENV_PREFIX-$UUID"
+				echo '[*] New Environment Name: ' $NEW_ENVIRONMENT_NAME
+
+				# Clone New Environment from Current
+				CLONE_STATUS=$(eb clone $ENVIRONMENT_NAME -v -n $NEW_ENVIRONMENT_NAME --exact --timeout 20)
+
+				# Get Cloudformation Stack name for new cloned beanstalk environment
+				STACK_NAME=$(aws elasticbeanstalk describe-environment-resources --environment-name $NEW_ENVIRONMENT_NAME | jq '.EnvironmentResources.AutoScalingGroups[].Name' | tr -d '"' | cut -d '-' -f 1-4)
+				STACK_NAME="$STACK_NAME-AWSEBSecurityGroup"
+
+				#Use stack name to get new security group id
+				SECURITY_GROUP_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values="$STACK_NAME*" | jq '.SecurityGroups' | jq -r '.[].GroupId')
+
+				# Create Ingress Rule
+				aws ec2 authorize-security-group-ingress --group-id $RDS_SECURITY_GROUP_ID --protocol tcp --port 3306 --source-group $SECURITY_GROUP_ID
+
+				# Get New Environment Status
+				STATUS=$(aws elasticbeanstalk describe-environments | jq '.Environments' | jq -r '.[] | select(.EnvironmentName=="'$NEW_ENVIRONMENT_NAME'") | .Status')
+				echo '[*] New Environment Status: ' $STATUS
+
+				# Error handling: New Environment Status
+				if [ $STATUS != "Ready" ]
+				then
+					echo '[*] Something is wrong with the new environment exiting now...'
+					exit 1
+				fi
+
+				echo '[*] Environment is ready. Starting Deployment Now.'
+				sleep 1
+
+				# Deployment of new application version
+				DEPLOY_STATUS=$(eb deploy $NEW_ENVIRONMENT_NAME -v -l $VERSION_LABEL --timeout 90)
+				sleep 1
+            
+				# Error handling: Deploy
+				if echo "${DEPLOY_STATUS}" | grep -q "Environment update completed successfully."; then
+					echo "[*] Deployment Succeeded!:: "
+				else
+					echo "[*] Deployment Failed!:: "
+					echo $DEPLOY_STATUS
+					echo "failures = Production Deployment FAILED" > failures.properties
+					exit 1
+				fi
+	            
+	            
+				# Write Vars for later stages
+				echo 'export ENVIRONMENT_NAME='$ENVIRONMENT_NAME > blueGreenVars
+				echo 'export NEW_ENVIRONMENT_NAME='$NEW_ENVIRONMENT_NAME >> blueGreenVars
+				echo 'export RDS_SECURITY_GROUP_ID='$RDS_SECURITY_GROUP_ID >> blueGreenVars
+				echo 'export BLUE_TARGET_GROUP_ARN='$BLUE_TARGET_GROUP_ARN >> blueGreenVars
+				echo 'export GREEN_TARGET_GROUP_ARN='$GREEN_TARGET_GROUP_ARN >> blueGreenVars
+				chmod +x blueGreenVars
+
+				# Print Url for Green Site
+				GREENSITE_CNAME=$(aws elasticbeanstalk describe-environments --environment-name $NEW_ENVIRONMENT_NAME | jq '.Environments' | jq -r '.[] | .CNAME')
+				echo 'New Environment CNAME:' $GREENSITE_CNAME
+				sleep 1
+
+				# Get amount of green (new) instances
+				INSTANCE_COUNT=$(aws elasticbeanstalk describe-environment-resources --environment-name $NEW_ENVIRONMENT_NAME | jq '.EnvironmentResources.Instances' | jq length)
+				# Get list of green instance id's
+				declare -a GREEN_INSTANCE_LIST
+				for ((i=1;i<INSTANCE_COUNT+1;i++))
+				do
+					echo $i
+					j=$i-1
+					GREEN_INSTANCE_LIST[$i]=$(aws elasticbeanstalk describe-environment-resources --environment-name $NEW_ENVIRONMENT_NAME| jq '.EnvironmentResources.Instances['$j'].Id' | tr -d '"')
+					echo ${GREEN_INSTANCE_LIST[$i]}
+				done
+
+				# Add targets to green target group
+				for i in "${GREEN_INSTANCE_LIST[@]}"
+				do
+					echo "$i"
+					aws elbv2 register-targets --target-group-arn $GREEN_TARGET_GROUP_ARN --targets Id="$i"
+				done
+                
+                # Update CNAME record for green consumer in Cloudflare
+                echo 'Updating Cloudflare CNAME - green-consumer.puppyspot.com'
+                
+                curl -X PUT "https://api.cloudflare.com/client/v4/zones/94d91f69b54b8059420ac770941d034d/dns_records/b01a2878d246eb6570a5a96b0e354f5b" \
+                     -H "X-Auth-Email: domains@puppyspot.com" \
+                     -H "X-Auth-Key: b414649936974152a2f3f19b98843882bab1a" \
+                     -H "Content-Type: application/json" \
+                	 --data '{"type":"CNAME","name":"green-consumer.puppyspot.com","content":"'"$GREENSITE_CNAME"'","ttl":1,"proxied":false}'
+                
+                # Updates CNAME record for pupcdn in Cloudflare
+                echo 'Updating Cloudflare CNAME - blue-green.pupcdn.com'
+                
+                curl -X PUT "https://api.cloudflare.com/client/v4/zones/e7ab3c5808136b04571db6a92f4e534d/dns_records/0ef36ba3a07c0ae22ddaf31e7df30359" \
+                     -H "X-Auth-Email: domains@puppyspot.com" \
+                     -H "X-Auth-Key: b414649936974152a2f3f19b98843882bab1a" \
+                     -H "Content-Type: application/json" \
+	                 --data '{"type":"CNAME","name":"blue-green.pupcdn.com","content":"'"$GREENSITE_CNAME"'","ttl":1,"proxied":false}'
+	            
+	            eb use $NEW_ENVIRONMENT_NAME     
+                eb setenv CDN_URL=https://blue-green.pupcdn.com
+                
+                # Updates API URL if it's a combined deploy.  Triple qoutes required in order to access GROOVY variables 	 
+                ''' + """
+                if [ $COMBINED_OR_SINGLE = 'Combined' ]; """ + ''' then 
+                    eb use $NEW_ENVIRONMENT_NAME
+                    eb setenv CORE_API_BASE_URI=https://green-api.puppyspot.com 
+                fi
+                
+                echo "Green site is up!  You may begin testing at:  https://green-consumer.puppyspot.com"
+				'''
+			  	script {
+                    IS_POST_CLONE = true    
+
+			  	}
+			}
+		}
+
+		stage('Swap URLs') {
+			steps {
+				timeout(time: 6, unit: 'HOURS') {
+					input 'Swap URLs?'
+				}
+                
+                sh '''#!/bin/bash
+                set -e
+                set -x
+                
+                #Get Blue/green environment names
+                source ./blueGreenVars
+                
+                eb use $NEW_ENVIRONMENT_NAME
+                eb setenv CDN_URL=https://core.pupcdn.com
+                
+                # Sleep to ensure httpd can recover if it crashed (cron every minute)
+                sleep 90
+                
+                ''' + """
+                if [ $COMBINED_OR_SINGLE = 'Combined' ]; """ + ''' then 
+                    eb use $NEW_ENVIRONMENT_NAME
+                    eb setenv CORE_API_BASE_URI=https://api.puppyspot.com 
+                fi
+
+
+                #Swap URLS Blue to Green
+                echo '[*] Swapping CNAME Urls from ' $ENVIRONMENT_NAME ' to ' $NEW_ENVIRONMENT_NAME
+                SWAP_STATUS=$(eb swap $NEW_ENVIRONMENT_NAME -v -n $ENVIRONMENT_NAME)
+                sleep 3
+
+                # Error handling: Swap
+                if echo "${SWAP_STATUS}" | grep -q "Completed swapping CNAMEs for environments"; then
+					echo "[*] URL Swap Succeeded!:: "
+                else
+					echo "[*] URL Swap Failed!:: "
+					echo "failures = URL Swap FAILED" > failures.properties
+					exit 1
+                fi
+
+                # Get amount of green (new) instances
+                INSTANCE_COUNT=$(aws elasticbeanstalk describe-environment-resources --environment-name $NEW_ENVIRONMENT_NAME | jq '.EnvironmentResources.Instances' | jq length)
+                # Get list of green instance id's
+                declare -a GREEN_INSTANCE_LIST
+                for ((i=1;i<INSTANCE_COUNT+1;i++))
+                do
+					echo $i
+					j=$i-1
+					GREEN_INSTANCE_LIST[$i]=$(aws elasticbeanstalk describe-environment-resources --environment-name $NEW_ENVIRONMENT_NAME| jq '.EnvironmentResources.Instances['$j'].Id' | tr -d '"')
+					echo ${GREEN_INSTANCE_LIST[$i]}
+                done
+
+                # Remove targets from green target group and put in blue target group
+                for i in "${GREEN_INSTANCE_LIST[@]}"
+                do
+					echo "$i"
+					aws elbv2 deregister-targets --target-group-arn $GREEN_TARGET_GROUP_ARN --targets Id="$i"
+					sleep 1
+					aws elbv2 register-targets --target-group-arn $BLUE_TARGET_GROUP_ARN --targets Id="$i"
+                done
+
+                sleep 5
+
+                # Get instance count for blue old environment
+                INSTANCE_COUNT=$(aws elasticbeanstalk describe-environment-resources --environment-name $ENVIRONMENT_NAME | jq '.EnvironmentResources.Instances' | jq length)
+                declare -a BLUE_INSTANCE_LIST
+                # Get instance ids of blue environment
+                for ((i=1;i<INSTANCE_COUNT+1;i++))
+                do
+					echo $i
+					j=$i-1
+					BLUE_INSTANCE_LIST[$i]=$(aws elasticbeanstalk describe-environment-resources --environment-name $ENVIRONMENT_NAME | jq '.EnvironmentResources.Instances['$j'].Id' | tr -d '"')
+					echo ${BLUE_INSTANCE_LIST[$i]}
+                done
+
+                # Deregister targets
+                for i in "${BLUE_INSTANCE_LIST[@]}"
+                do
+					echo "$i"
+					aws elbv2 deregister-targets --target-group-arn $BLUE_TARGET_GROUP_ARN --targets Id="$i"
+                done
+
+                echo "Green site is live!  All testing at this point should be done at:  https://www.puppyspot.com"
+                '''
+				script {
+                    IS_POST_SWAP = true    
+                }
+			}
+		}
+
+		stage('Pull Request') {
+			steps {
+				timeout(time: 6, unit: 'HOURS') {
+					input 'Terminate Original Environment?  NOTE: THERE IS NO ROLLBACK AFTER THIS STEP.'
+				}
+				sh """#!/bin/sh
+				set -x
+				### Create Pull Request into master
+
+				PR="\$(php ~/jenkinsgit/jenkinsgit.php -rCONSUMER --create-pull-request --source=${env.BRANCH_SCOPE} --dest="master" 2>&1)"
+				if echo \$PR | grep -q "^success\$"; then
+					echo "Pull request created!"
+				else
+					echo "ERROR: Failed to create Pull Request!:: "
+					echo \$PR
+					echo "failures = ERROR: Failed to create Pull Request" > failures.properties
+					exit 1
+				fi
+				"""
+			}
+		}
+
+		stage('Terminate Original Env') {
+			steps {
+				sh '''#!/bin/bash
+				set -e
+				set -x
+
+				#Get Blue/green environment names
+				source ./blueGreenVars
+
+				# Get Cloudformation Stack name for old  beanstalk environment
+				STACK_NAME=$(aws elasticbeanstalk describe-environment-resources --environment-name $ENVIRONMENT_NAME | jq '.EnvironmentResources.AutoScalingGroups[].Name' | tr -d '"' | cut -d '-' -f 1-4)
+				STACK_NAME="$STACK_NAME-AWSEBSecurityGroup"
+
+				#Use stack name to get new security group id
+				SECURITY_GROUP_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values="$STACK_NAME*" | jq '.SecurityGroups' | jq -r '.[].GroupId')
+
+				# Delete RDS SG Ingress Rule for old environment
+				aws ec2 revoke-security-group-ingress --group-id $RDS_SECURITY_GROUP_ID --protocol tcp --port 3306 --source-group $SECURITY_GROUP_ID
+
+				#Terminate Old Environment
+				echo '[*] Terminating Original Environment: ' $ENVIRONMENT_NAME
+				TERMINATE_STATUS=$(eb terminate $ENVIRONMENT_NAME -v  --force --timeout 60)
+
+				# Error handling Terminate
+				if echo "${TERMINATE_STATUS}" | grep -q "terminateEnvironment completed successfully"; then
+					echo "[*] Old Environment Terminated Successfully!:: "
+				else
+					echo "[*] Termination Failed!:: Environment: " $ENVIRONMENT_NAME
+					echo "failures = Termination FAILED" > failures.properties
+					exit 1
+				fi
+
+				echo '[*] PIPELINE SUCCESS'
+				exit
+				'''
+			}
+		}
+		
+        stage ('Running Ansible Jobs') {
+			steps {
+				build job: 'RunAnsibleJobs', wait: false
+			}
+		}
+            
+		stage ('Trigger UpdateLogic Monitor') {
+			steps {
+				build job: 'UpdateLogicMonitor'
+			}
+		}
+            
+		stage ('Trigger Verification Job') {
+			steps {
+				build job: 'Verify Production Deployment', parameters: [[$class: 'GitParameterValue', name: 'Branch', value: "${env.BRANCH_SCOPE}"]]
+			}
+		}
+		
+		stage ('Update Green Test Env') {
+			steps {
+				build job: 'Green Deployments/Deploy Master to Consumer', wait: false
+			}
+		}		
+	}
+
+    post {
+        aborted {
+            script {
+                echo "Build was ABORTED.  Reverting..."
+
+                if (IS_POST_SWAP == true) {
+                    echo "Swapping URLs back to original setting..."
+					
+					sh '''#!/bin/bash
+					set -e
+					set -x
+
+					#Get Blue/green environment names
+					source ./blueGreenVars
+
+					# Swap URLS BLUE to GREEN --> Roll back. Everything needs to go backwards.
+					#
+					echo '[*] Swapping CNAME Urls from ' $NEW_ENVIRONMENT_NAME ' to ' $ENVIRONMENT_NAME
+					SWAP_STATUS=$(eb swap $ENVIRONMENT_NAME -v -n $NEW_ENVIRONMENT_NAME)
+					sleep 3
+
+					# Error handling: Swap
+					if echo "${SWAP_STATUS}" | grep -q "Completed swapping CNAMEs for environments"; then
+						echo "[*] URL Swap Succeeded!:: "
+					else
+						echo "[*] URL Swap Failed!:: "
+						echo "failures = URL Swap FAILED" > failures.properties
+						echo "Contact DevOps to inspect the system"
+						exit 1
+					fi
+
+					# Get instance count for blue old environment
+					INSTANCE_COUNT=$(aws elasticbeanstalk describe-environment-resources --environment-name $ENVIRONMENT_NAME | jq '.EnvironmentResources.Instances' | jq length)
+					# Get list of blue instance id's
+					declare -a BLUE_INSTANCE_LIST
+					for ((i=1;i<INSTANCE_COUNT+1;i++))
+					do
+						echo $i
+						j=$i-1
+						BLUE_INSTANCE_LIST[$i]=$(aws elasticbeanstalk describe-environment-resources --environment-name $ENVIRONMENT_NAME| jq '.EnvironmentResources.Instances['$j'].Id' | tr -d '"')
+						echo ${BLUE_INSTANCE_LIST[$i]}
+					done
+
+					# Register targets
+					for i in "${BLUE_INSTANCE_LIST[@]}"
+					do
+						echo "$i"
+						aws elbv2 register-targets --target-group-arn $BLUE_TARGET_GROUP_ARN --targets Id="$i"
+					done
+
+					# Get amount of green (new) instances
+					INSTANCE_COUNT=$(aws elasticbeanstalk describe-environment-resources --environment-name $NEW_ENVIRONMENT_NAME | jq '.EnvironmentResources.Instances' | jq length)
+					# Get list of green instance id's
+					declare -a GREEN_INSTANCE_LIST
+					for ((i=1;i<INSTANCE_COUNT+1;i++))
+					do
+						echo $i
+						j=$i-1
+						GREEN_INSTANCE_LIST[$i]=$(aws elasticbeanstalk describe-environment-resources --environment-name $NEW_ENVIRONMENT_NAME | jq '.EnvironmentResources.Instances['$j'].Id' | tr -d '"')
+						echo ${GREEN_INSTANCE_LIST[$i]}
+					done
+
+					# Remove targets from green target group and put in blue target group
+					for i in "${GREEN_INSTANCE_LIST[@]}"
+					do
+						echo "$i"
+						aws elbv2 deregister-targets --target-group-arn $BLUE_TARGET_GROUP_ARN --targets Id="$i"
+					done
+					
+					sleep 5
+
+					'''
+                }
+                
+                if (IS_POST_CLONE == true) {
+                    echo "Destroy Non-Live Beanstalk"
+					sh '''#!/bin/bash
+					set -e
+					set -x
+
+					#Get Blue/green environment names
+					source ./blueGreenVars
+
+					# Get Cloudformation Stack name for new  beanstalk environment
+					STACK_NAME=$(aws elasticbeanstalk describe-environment-resources --environment-name $NEW_ENVIRONMENT_NAME | jq '.EnvironmentResources.AutoScalingGroups[].Name' | tr -d '"' | cut -d '-' -f 1-4)
+					STACK_NAME="$STACK_NAME-AWSEBSecurityGroup"
+
+					#Use stack name to get new security group id
+					SECURITY_GROUP_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values="$STACK_NAME*" | jq '.SecurityGroups' | jq -r '.[].GroupId')
+
+					# Delete RDS SG Ingress Rule for new environment
+					aws ec2 revoke-security-group-ingress --group-id $RDS_SECURITY_GROUP_ID --protocol tcp --port 3306 --source-group $SECURITY_GROUP_ID
+
+					#Terminate New Environment
+					echo '[*] Terminating Original Environment: ' $NEW_ENVIRONMENT_NAME
+					TERMINATE_STATUS=$(eb terminate $NEW_ENVIRONMENT_NAME -v  --force)
+
+					# Error handling Terminate
+					if echo "${TERMINATE_STATUS}" | grep -q "terminateEnvironment completed successfully"; then
+						echo "[*] New Environment Terminated Successfully!:: "
+					else
+						echo "[*] Termination Failed!:: Environment: " $NEW_ENVIRONMENT_NAME
+						echo "failures = Termination FAILED" > failures.properties
+						echo "Contact DevOps to inspect the system"
+					exit 1
+					fi
+
+					echo '[*] PIPELINE SUCCESS'
+					exit
+					'''                
+				}
+            }
+        }
+		
+		failure {
+            script {
+                echo "Build was a FAILURE.  Reverting..."
+
+                if (HAS_STARTED_CLONE == true && IS_POST_SWAP == false) {
+                    echo "Destroy Non-Live Beanstalk"
+					sh '''#!/bin/bash
+					set -e
+					set -x
+
+					#Get Blue/green environment names
+					source ./blueGreenVars
+
+					# Get Cloudformation Stack name for new  beanstalk environment
+					STACK_NAME=$(aws elasticbeanstalk describe-environment-resources --environment-name $NEW_ENVIRONMENT_NAME | jq '.EnvironmentResources.AutoScalingGroups[].Name' | tr -d '"' | cut -d '-' -f 1-4)
+					STACK_NAME="$STACK_NAME-AWSEBSecurityGroup"
+
+					#Use stack name to get new security group id
+					SECURITY_GROUP_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values="$STACK_NAME*" | jq '.SecurityGroups' | jq -r '.[].GroupId')
+
+					# Delete RDS SG Ingress Rule for new environment
+					aws ec2 revoke-security-group-ingress --group-id $RDS_SECURITY_GROUP_ID --protocol tcp --port 3306 --source-group $SECURITY_GROUP_ID
+
+					#Terminate New Environment
+					echo '[*] Terminating Original Environment: ' $NEW_ENVIRONMENT_NAME
+					TERMINATE_STATUS=$(eb terminate $NEW_ENVIRONMENT_NAME -v  --force)
+
+					# Error handling Terminate
+					if echo "${TERMINATE_STATUS}" | grep -q "terminateEnvironment completed successfully"; then
+						echo "[*] New Environment Terminated Successfully!:: "
+					else
+						echo "[*] Termination Failed!:: Environment: " $NEW_ENVIRONMENT_NAME
+						echo "failures = Termination FAILED" > failures.properties
+						echo "Contact DevOps to inspect the system"
+					exit 1
+					fi
+
+					echo '[*] PIPELINE SUCCESS'
+					exit
+					'''                
+				}
+			}
+		}
+		
+		cleanup {
+			deleteDir()
+		}
+    }
+}
